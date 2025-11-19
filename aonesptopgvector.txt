@@ -1,0 +1,237 @@
+import os
+import json
+import boto3
+import psycopg
+from pgvector.psycopg import register_vector
+from botocore.exceptions import ClientError
+from datetime import datetime, timezone
+import traceback
+import io # Needed if using PDF extraction helpers
+
+# --- GLOBAL CONFIGURATION (Consistent with your existing setup) ---
+SECRET_NAME = "rds-db-credentials/cluster-CZRGZG2DXJGCQGM4OZTEHRR2SU/postgres/1762906251764"
+BEDROCK_EMBEDDING_MODEL = "cohere.embed-english-v3"
+BEDROCK_LLM_MODEL = "anthropic.claude-3-sonnet-20240229-v1:0" # Example LLM
+AWS_REGION = "us-east-1"
+# Database name for connection
+DB_NAME = "aonebankpgvdb" 
+# Number of top chunks to retrieve for RAG
+K_CHUNKS = 5 
+
+# --- AWS Clients (Global for reuse) ---
+secretsmanager = boto3.client('secretsmanager')
+bedrock_runtime = boto3.client(service_name='bedrock-runtime', region_name=AWS_REGION)
+
+# --- Database Connection Management ---
+DB_CONN = None 
+
+def get_secret():
+    """Retrieves RDS credentials from Secrets Manager."""
+    client = boto3.client("secretsmanager", region_name=AWS_REGION)
+    try:
+        get_secret_value_response = client.get_secret_value(SecretId=SECRET_NAME)
+    except ClientError as e:
+        raise Exception(f"Could not retrieve secret: {e}")
+    return get_secret_value_response["SecretString"]
+
+def get_db_connection():
+    """Establishes or reuses the PostgreSQL connection with pgvector registration."""
+    global DB_CONN
+    if DB_CONN is None or DB_CONN.closed:
+        print("Establishing new DB connection...")
+        try:
+            secret_dict = json.loads(get_secret())
+            DB_CONN = psycopg.connect(
+                host=secret_dict["host"],
+                dbname=DB_NAME,
+                user=secret_dict["username"],
+                password=secret_dict["password"],
+                port=secret_dict["port"],
+                autocommit=True # Use autocommit for simple read queries
+            )
+            register_vector(DB_CONN)
+            print("Successfully connected to DB.")
+        except Exception as e:
+            print(f"Error connecting to database: {e}")
+            raise
+    return DB_CONN
+
+# --- Bedrock Helper Functions ---
+
+def get_embedding_from_bedrock(text):
+
+    """Generate embedding for the user's query."""
+    try:
+        body = json.dumps({
+            "texts": [text], 
+            # Use 'search_query' for embedding the query itself
+            "input_type": "search_query" 
+        })
+        
+        response = bedrock_runtime.invoke_model(
+            modelId=BEDROCK_EMBEDDING_MODEL,
+            contentType="application/json",
+            accept="application/json",
+            body=body
+        )
+        response_body = json.loads(response["body"].read())
+        # Returns a list of floats (the embedding vector)
+        return response_body.get("embeddings", [[]])[0]
+    except Exception as e:
+        print(f"Bedrock Embeddings Error: {e}")
+        raise
+
+def generate_llm_response(query, context_chunks_text):
+    
+    """Generates the response from the chucks retrieved from PGVector using Bedrock LLM with retrieved context."""
+    
+    context = "\n---\n".join(context_chunks_text)
+
+    prompt_template = f"""
+You are an expert Q&A assistant for AONE Bank. Use the following CONTEXT to answer the USER QUERY.
+If the answer is not found in the CONTEXT, state clearly that you cannot answer the question based on the provided documents.
+
+CONTEXT:
+{context}
+
+USER QUERY:
+{query}
+
+ANSWER:
+"""
+
+    request_body = json.dumps({
+        "anthropic_version": "bedrock-2023-05-31",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": prompt_template
+                    }
+                ]
+            }
+        ],
+        "max_tokens": 2000,
+        "temperature": 0.1
+    })
+
+    try:
+        response = bedrock_runtime.invoke_model(
+            modelId=BEDROCK_LLM_MODEL,
+            contentType="application/json",
+            accept="application/json",
+            body=request_body
+        )
+        response_body = json.loads(response["body"].read())
+        completion = response_body["content"][0]["text"]
+        return completion.strip()
+    except Exception as e:
+        print(f"Bedrock LLM Generation Error: {e}")
+        raise
+
+
+# --- Core RAG Logic ---
+
+def query_pgvector_rag(user_query: str):
+    """
+    1. Generates embedding for the query.
+    2. Searches PGVector table for top K relevant chunks.
+    3. Returns LLM answer and list of documents referenced.
+    """
+
+    # 1?? Generate query embedding
+    query_vector = get_embedding_from_bedrock(user_query)
+
+    # 2?? get Postgres PGVector database connectivity from secrets manager
+    #     - Initialize chunks and documents list
+    #     -   Search PGVector Table
+    conn = get_db_connection()
+    chunks = []
+    documents = []
+
+    try:
+        with conn.cursor() as cur:
+            # Convert vector list to PostgreSQL array string
+            vector_str = '[' + ','.join(map(str, query_vector)) + ']'
+
+            SQL_QUERY = f"""
+            SELECT chunk_text, document_name
+            FROM aone_corp_sprepo_docs
+            ORDER BY embedding <-> '{vector_str}' ASC
+            LIMIT {K_CHUNKS};
+            """
+
+            cur.execute(SQL_QUERY)
+            for row in cur.fetchall():
+                chunks.append(row[0])       # chunk_text
+                documents.append(row[1])    # document_name
+
+    except Exception as e:
+        print(f"pgvector Search Error: {e}")
+        raise
+
+    if not chunks:
+        return {
+            "query": user_query,
+            "answer": "No relevant documents found in the corporate governance portal.",
+            "retrieval_status": "Failed",
+            "documents_list": []
+        }
+
+    # 3?? Generate LLM Response (RAG)
+    llm_answer = generate_llm_response(user_query, chunks)
+
+    return {
+        "query": user_query,
+        "answer": llm_answer,
+        "retrieved_chunks_count": len(chunks),
+        "retrieval_status": "Success",
+        "documents_list": list(dict.fromkeys(documents))  # deduplicate while preserving order
+    }
+
+# --- Lambda handler Main function calling other functions above.
+
+def lambda_handler(event, context):
+    try:
+        print("Starting RAG query execution.")
+        
+        # 1. Parse Input JSON from API Gateway called from powerautomate of sharepoint.
+        # API Gateway input is often nested under 'body' and is a string
+        body_string = event.get('body', '{}')
+        try:
+            body = json.loads(body_string)
+        except json.JSONDecodeError:
+            print("ERROR: Invalid JSON in request body.")
+            return {"statusCode": 400, "body": json.dumps({"error": "Invalid JSON input."})}
+            
+        user_query = body.get('query') or body.get('text')
+        
+        if not user_query or not isinstance(user_query, str):
+            print("ERROR: Missing or invalid 'query' or 'text' field.")
+            return {"statusCode": 400, "body": json.dumps({"error": "Please provide a valid 'query' string in the request body."})}
+
+        # 2. Execute RAG Pipeline which includes:
+        #    - Also query embedding and vector search
+        #    - Retrieval from PGVector
+        #    - Generation of LLM Response
+        print(f"Received query: {user_query}")
+        response_data = query_pgvector_rag(user_query)
+
+        # 3. Return JSON Response
+        return {
+            "statusCode": 200, 
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps(response_data)
+        }
+
+    except Exception as e:
+        print(f"ERROR: Unhandled exception during RAG execution: {e}")
+        # Log the full traceback for better debugging
+        traceback.print_exc() 
+        return {
+            "statusCode": 500, 
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"error": "Internal server error during RAG process.", "details": str(e)})
+        }
