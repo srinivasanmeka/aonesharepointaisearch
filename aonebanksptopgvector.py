@@ -112,7 +112,7 @@ def get_sp_secrets():
     print("inside get_sp_secrets before cert_response and cert_binary")
 
     try:
-        # Retrieve Base64-encoded PFX certificate ---
+        # Retrieve Base64-encoded PFX certificate
         cert_response = secretsmanager.get_secret_value(SecretId="aone/sharepoint/connection")
         secret_data = json.loads(cert_response['SecretString'])  # Parse JSON
         cert_b64 = secret_data['sp_secret']  # make sure this matches the key in the secret
@@ -121,7 +121,7 @@ def get_sp_secrets():
 
         print(f"DIAGNOSTIC: Decoded PFX Binary size: {len(cert_binary)} bytes")
 
-        # --- 2. Retrieve client_id, tenant_id, cert_password from config secret ---
+        #  Retrieve client_id, tenant_id, cert_password from config secret
         config_response = secretsmanager.get_secret_value(SecretId="aonebank/cert-config")
         config_data = json.loads(config_response['SecretString'])
         cert_password = config_data['cert_password'].strip()
@@ -131,7 +131,7 @@ def get_sp_secrets():
         print(f"FATAL ERROR: Could not retrieve or decode secrets: {e}")
         raise e
 
-    # --- 3. Load and decrypt PFX to PEM ---
+    # Load and decrypt PFX to PEM
     try:
         private_key, certificate, ca_certificates = pkcs12.load_key_and_certificates(
             cert_binary,
@@ -144,7 +144,7 @@ def get_sp_secrets():
 
     print("after pkcs12.load_key_and_certificates (success)")
 
-    # --- 4. Write PEM files to /tmp ---
+    # Write PEM files to /tmp
     KEY_PEM_PATH = "/tmp/key.pem"
     CERT_PEM_PATH = "/tmp/cert.pem"
 
@@ -162,12 +162,12 @@ def get_sp_secrets():
 
     print("AUTH_DEBUG: PFX successfully converted to PEM files.")
 
-    # --- 5. Return all values needed by main lambda ---
+    # Return all values needed in main Lambda
     config_data['key_path'] = KEY_PEM_PATH
     config_data['cert_path'] = CERT_PEM_PATH
     return config_data
 
-# --- Database configuration from Secrets Manager ---
+# get PGVector credentials from AWS Secrets Manager 
 def get_secret():
     client = boto3.client("secretsmanager", region_name=AWS_REGION)
     try:
@@ -176,7 +176,7 @@ def get_secret():
         raise Exception(f"Could not retrieve secret: {e}")
     return get_secret_value_response["SecretString"]
 
-# --- Connect to PostgreSQL and register pgvector ---
+# Connect to PostgreSQL and register pgvector
 def get_db_connection():
 
     print("inside get_db_connection")
@@ -214,7 +214,7 @@ def extract_text_from_docx(file_content_bytes):
     print("Word document extraction when ready.")
     return "DOCX Word document extraction when ready using python-docx."
 
-# --- Read sharepoint URL and read documents to store chunks into pgvector table ---
+# Read sharepoint URL and read documents to store chunks into pgvector table
 def ingest_documents(ctx: ClientContext, document_library_title: str, folder_relative_path: str):
     
     conn = None
@@ -324,10 +324,8 @@ def ingest_documents(ctx: ClientContext, document_library_title: str, folder_rel
     conn.close()
     print("  files processed and stored in pgvector.")
 
-# --- Lambda handler ---
+# AWS Lambda handle main function
 def lambda_handler(event, context):
-    # --- The entire function logic is now safely wrapped in ONE try/except block ---
-    # The 'try' must align with the 'except' below.
 
     try:
         print("beginning of lambda_handler execution")
@@ -460,7 +458,7 @@ def lambda_handler(event, context):
             # Raising an exception here will trigger the outer 'except' block below
             raise Exception("Token acquisition failed via MSAL.")
 
-    # --- Catch-all exception handler for the entire lambda_handler ---
+    #  exception handler for the entire main Lambda
     except Exception as e:
         # Import traceback locally to prevent shadowing/global errors
         import sys, traceback # Local import is safer here
