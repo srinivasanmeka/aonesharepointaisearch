@@ -1,6 +1,7 @@
 # Lambda function aonebanksptopgvector Code to ingest sharepoint documents to PGVector aonebanksptopgvector
 # Author: Srinivasan Meka
 # Creation Date: 18-NOV-2025
+# Updated Date: 14-DEC-2025
 import os
 import base64
 import boto3
@@ -46,25 +47,6 @@ CERT_PEM_PATH = "/tmp/cert.pem"
 KEY_PEM_PATH = "/tmp/key.pem"
 
 
-def list_root_folders(ctx):
-    web = ctx.web
-    ctx.load(web.folders)
-    ctx.execute_query()
-    print("Root-level folders:")
-    for f in web.folders:
-        print(f"??", f.properties["ServerRelativeUrl"])
-
-def list_doc_libs(ctx):
-    lists = ctx.web.lists
-    ctx.load(lists, ["Title", "BaseType", "RootFolder"])
-    ctx.execute_query()
-    print("Document Libraries:")
-    for l in lists:
-        if l.properties["BaseType"] == 1:  # 1 = Document Library
-            root_folder = l.root_folder
-            ctx.load(root_folder)
-            ctx.execute_query()
-            print(f"?? {l.properties['Title']} - {root_folder.serverRelativeUrl}")
 
 def get_all_files(ctx, folder_relative_url):
    
@@ -130,7 +112,7 @@ def get_sp_secrets():
     print("inside get_sp_secrets before cert_response and cert_binary")
 
     try:
-        # --- 1. Retrieve Base64-encoded PFX certificate ---
+        # Retrieve Base64-encoded PFX certificate ---
         cert_response = secretsmanager.get_secret_value(SecretId="aone/sharepoint/connection")
         secret_data = json.loads(cert_response['SecretString'])  # Parse JSON
         cert_b64 = secret_data['sp_secret']  # make sure this matches the key in the secret
@@ -350,7 +332,7 @@ def lambda_handler(event, context):
     try:
         print("beginning of lambda_handler execution")
 
-        # --- 1. CONFIGURATION RETRIEVAL AND FILE PREPARATION ---
+        # Reading secrets and certificate from aws secrets manager get_sp_secrets()
         # Check if the PEM files exist (warm start check)
         if not os.path.exists(CERT_PEM_PATH) or not os.path.exists(KEY_PEM_PATH):
             print("AUTH_DEBUG: Cold Start - Retrieving and converting PFX to PEM in Secrets Manager")
@@ -378,7 +360,7 @@ def lambda_handler(event, context):
              with open(CERT_PEM_PATH, "r") as f:
                  print(f"CERT PEM preview (first 100 chars):\n{f.read(100)}")
 
-        # --- 2. MSAL AUTHENTICATION ---
+        # MSAL AUTHENTICATION and 
         # MSAL Configuration
         AUTHORITY = f"https://login.microsoftonline.com/{tenant_id}"
         # NOTE: Ensure this thumbprint matches the one uploaded to your Azure App Registration
@@ -403,14 +385,14 @@ def lambda_handler(event, context):
         # Acquire the token
         result = app.acquire_token_for_client(scopes=SCOPE)
 
-        # --- 3. SHAREPOINT CONTEXT AND EXECUTION ---
+        # Sharepoint context and getting MSAL token after authentication is successful 
         if "access_token" in result:
             access_token = result['access_token']
             
             # Extract expires_on (Unix timestamp) from MSAL result for the client library
             expires_on = result.get('expires_on')
             
-            # --- FIX: Create a class to hold token information including expiration ---
+            # Create a class to hold token information including expiration
             class AccessTokenInfo(object):
                 def __init__(self, token_type, access_token, expires_on):
                     # SharePoint client expects these exact attribute names
@@ -427,7 +409,7 @@ def lambda_handler(event, context):
 
             #ctx = ClientContext(site_url).with_access_token(access_token)
 
-# --- TIMEZONE FIX (safe for all Office365 SDK versions) ---
+# TIMEZONE format MSAL Library token_expires converting to timezone format. 
             try:
                 auth_ctx = getattr(ctx, "authentication_context", None)
                 if auth_ctx and hasattr(auth_ctx, "_token_expires"):
